@@ -75,8 +75,6 @@ void setup() {
   for (int i = 0; i < SMOOTH_SIZE; i++) {
     freqHistory[i] = 0.0f;
   }
-
-  Serial.println("Ready!");
 }
 
 void loop() {
