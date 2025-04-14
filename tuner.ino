@@ -4,11 +4,10 @@
 #include <arduinoFFT.h>
 #include <math.h>
 
-#define I2S_SD_PIN  4  // SD (data) pin
-#define I2S_WS_PIN  2  // WS (word select) pin
-#define I2S_SCK_PIN 3  // SCK (bit clock) pin
-
-#define log2(x) log(x)/log(2)
+// Adjust these pins for your microphone breakout:
+#define I2S_SD_PIN  4   // SD (data) pin
+#define I2S_WS_PIN  2   // WS (word select) pin
+#define I2S_SCK_PIN 3   // SCK (bit clock) pin
 
 // Define standard guitar string frequencies (E2, A2, D3, G3, B3, E4)
 const float NOTES[] = {82.41, 110.00, 146.83, 196.00, 246.94, 329.63};
@@ -18,56 +17,45 @@ const int NUM_NOTES = 6;
 // Tolerance in Hz for considering a note "in tune"
 const float TUNE_TOLERANCE = 1.0;
 
-#define SAMPLE_RATE 44100
-#define BUFFER_SIZE 512
-const uint16_t samples = BUFFER_SIZE; // This value MUST ALWAYS be a power of 2
-unsigned int samplingPeriod;
+// Try a higher sample rate for better frequency resolution
+#define SAMPLE_RATE 8000
 
-float vReal[samples];
-float vImag[samples];
+// Increase or decrease as desired (power of 2). Larger → finer resolution, but slower updates.
+#define BUFFER_SIZE 4096
 
-ArduinoFFT<float> FFT = ArduinoFFT<float>(vReal, vImag, samples, SAMPLE_RATE); /* Create FFT object */
+// Lower and upper frequency bounds you expect for a guitar note
+#define MIN_FREQUENCY 70.0
+#define MAX_FREQUENCY 350.0
 
-// there is no 72x40 constructor in u8g2 hence the 72x40 screen is
-// mapped in the middle of the 132x64 pixel buffer of the SSD1306 controller
+// Arrays for FFT
+float vReal[BUFFER_SIZE];
+float vImag[BUFFER_SIZE];
+
+// We create the FFT object
+ArduinoFFT<float> FFT(vReal, vImag, BUFFER_SIZE, SAMPLE_RATE);
+
+// OLED (make sure pins match your setup)
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, 6, 5);
 int xOffset = 10; 
 int yOffset = 10; 
 
-// Add timing and averaging variables
-unsigned long lastUpdateTime = 0;
-const unsigned long UPDATE_INTERVAL = 100; // 100ms between updates
-float frequencyAccumulator = 0.0;
-int sampleCount = 0;
-
-// Define buffer size for audio samples
+// Buffer for I2S audio samples
 int32_t audioBuffer[BUFFER_SIZE];
-int bufferIndex = 0;
-bool bufferFull = false;
 
-// Improve frequency detection with better thresholds and filtering
-#define MIN_AMPLITUDE_THRESHOLD 0.01  // Minimum amplitude to consider a frequency valid
-#define MIN_FREQUENCY 70.0            // Lowest frequency to detect (below E2)
-#define MAX_FREQUENCY 350.0           // Highest frequency to detect (above E4)
-#define NOISE_FLOOR 0.005             // Noise floor for signal detection
-
-// Add a confidence measure for detected notes
-float lastValidFrequency = 0.0;
-int consecutiveReadings = 0;
-const int REQUIRED_CONSECUTIVE = 3;   // Number of consecutive readings needed to confirm a note
-
-// Add a buffer to store recent frequency readings
-#define FREQ_HISTORY_SIZE 5
-float recentFrequencies[FREQ_HISTORY_SIZE] = {0};
-int freqHistoryIndex = 0;
+// Forward declarations
+float processAudioBuffer();
+float findPeakFrequency();
+float checkHarmonics(float rawFreq);
+void displayTuning(int noteIndex, float frequency, float difference);
 
 void setup(void) {
     Serial.begin(115200);
-    
+
+    // I2S config
     i2s_config_t i2s_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
         .sample_rate = SAMPLE_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT, 
         .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
@@ -89,87 +77,147 @@ void setup(void) {
     i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
     i2s_set_pin(I2S_NUM_0, &pin_config);
 
+    // OLED init
     u8g2.begin();
-    u8g2.setContrast(255); // set contrast to maximum 
+    u8g2.setContrast(255);
     u8g2.setBusClock(400000); //400kHz I2C 
     u8g2.setFont(u8g2_font_9x18_tf);
-
-    samplingPeriod = round(1000000 * (1.0/SAMPLE_RATE));
 }
 
 void loop(void) {
-    // Fill the audio buffer
-    if (!bufferFull) {
-        size_t bytesRead = 0;
-        int32_t tempBuffer[samples];
-        
-        // Read audio samples from I2S
-        i2s_read(I2S_NUM_0, tempBuffer, samples * 4, &bytesRead, portMAX_DELAY);
-        
-        // Add samples to our buffer
-        for (int i = 0; i < samples && bufferIndex < BUFFER_SIZE; i++) {
-            audioBuffer[bufferIndex++] = tempBuffer[i];
-        }
-        
-        // Check if buffer is full
-        if (bufferIndex >= BUFFER_SIZE) {
-            bufferFull = true;
-        }
+    size_t bytesRead = 0;
+
+    // Read BUFFER_SIZE * 4 bytes (32-bit samples) from I2S
+    i2s_read(I2S_NUM_0, audioBuffer, BUFFER_SIZE * sizeof(int32_t), &bytesRead, portMAX_DELAY);
+
+    // Process the audio to get a raw frequency from the FFT
+    float rawFreq = processAudioBuffer();
+
+    // Attempt to correct for harmonics, e.g., if it's picking up the 2nd harmonic
+    float dominantFreq = checkHarmonics(rawFreq);
+
+    // Find the closest note
+    int closestNoteIndex = -1;
+    float difference = 0;
+    float minDifference = 9999;
+    if (dominantFreq > MIN_FREQUENCY && dominantFreq < MAX_FREQUENCY) {
+      for (int i = 0; i < NUM_NOTES; i++) {
+          float currentDiff = fabsf(dominantFreq - NOTES[i]);
+          if (currentDiff < minDifference) {
+              minDifference = currentDiff;
+              closestNoteIndex = i;
+              difference = (dominantFreq - NOTES[i]);
+          }
+      }
     }
-    
-    // Process data when buffer is full
-    if (bufferFull) {
-        float dominantFreq = processAudioBuffer();
-        
-        // Add to frequency history
-        recentFrequencies[freqHistoryIndex] = dominantFreq;
-        freqHistoryIndex = (freqHistoryIndex + 1) % FREQ_HISTORY_SIZE;
-        
-        // Get most common frequency from history
-        float mostCommonFreq = getMostCommonFrequency();
-        
-        // Find closest note and calculate tuning
-        int closestNoteIndex = -1;
-        float minDifference = 1000.0;
-        float difference = 0.0;
-        
-        for (int i = 0; i < NUM_NOTES; i++) {
-            float currentDiff = abs(mostCommonFreq - NOTES[i]);
-            if (currentDiff < minDifference) {
-                minDifference = currentDiff;
-                closestNoteIndex = i;
-                difference = mostCommonFreq - NOTES[i];
-            }
-        }
-        
-        // Display results on OLED
-        displayTuning(closestNoteIndex, mostCommonFreq, difference);
-        
-        // Reset buffer for next cycle
-        bufferIndex = 0;
-        bufferFull = false;
-    }
+
+    // Display the results
+    displayTuning(closestNoteIndex, dominantFreq, difference);
 }
 
 float processAudioBuffer() {
-    // Copy chunk to FFT input arrays
-    for (int i = 0; i < samples; i++) {
-        vReal[i] = (float)audioBuffer[i];
-        vImag[i] = 0.0;
+    // 1) Compute average (DC offset)
+    long long sum = 0;
+    for (int i = 0; i < BUFFER_SIZE; i++) {
+        int32_t sample = audioBuffer[i];
+        sum += sample;
+    }
+    float avg = (float)sum / BUFFER_SIZE;
+
+    // 2) Subtract average and populate vReal
+    for (int i = 0; i < BUFFER_SIZE; i++) {
+        float centeredSample = ((float) audioBuffer[i]) - avg;
+        vReal[i] = centeredSample;
+        vImag[i] = 0.0; 
     }
 
-    FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);	/* Weigh data */
-    FFT.compute(FFTDirection::Forward); /* Compute FFT */
-    FFT.complexToMagnitude(); /* Compute magnitudes */
-    float x = FFT.majorPeak();
-    return x;
+    // 3) Windowing + FFT
+    FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
+    FFT.compute(FFTDirection::Forward);
+    FFT.complexToMagnitude();
+
+    // 4) Find peak frequency with sub-bin interpolation
+    float freq = findPeakFrequency();
+    return freq;
+}
+
+/**
+ * Manually find the bin of max magnitude in vReal[0..(BUFFER_SIZE/2 - 1)]
+ * then use a simple parabolic interpolation around that bin to get sub-bin accuracy.
+ */
+float findPeakFrequency() {
+    // Ignore DC (bin 0) to avoid picking up offset noise
+    int startBin = 1;
+    int endBin = BUFFER_SIZE / 2; // Nyquist limit
+
+    float maxMagnitude = 0.0;
+    int maxIndex = -1;
+
+    // Find the index of the largest bin
+    for(int i = startBin; i < endBin; i++) {
+        if(vReal[i] > maxMagnitude) {
+            maxMagnitude = vReal[i];
+            maxIndex = i;
+        }
+    }
+
+    if (maxIndex <= 0) {
+        return 0.0; // No valid peak found
+    }
+
+    // Parabolic interpolation:
+    // Suppose the largest bin is i. We look at bins i-1 and i+1
+    // freqBin = i + 0.5*(A - C) / (A - 2B + C)
+    // Where B is the amplitude at i, A at i-1, C at i+1
+    float A = vReal[maxIndex - 1];
+    float B = vReal[maxIndex];
+    float C = vReal[maxIndex + 1];
+
+    float denom = (A - 2 * B + C);
+    float interpolation = 0.0;
+    if (fabsf(denom) > 1e-6) {
+        interpolation = 0.5f * (A - C) / denom;
+    }
+
+    float interpolatedIndex = (float)maxIndex + interpolation;
+
+    // Convert bin index to frequency
+    // Frequency resolution = sampleRate / FFT_size
+    float peakFreq = interpolatedIndex * ((float)SAMPLE_RATE / (float)BUFFER_SIZE);
+    return peakFreq;
+}
+
+/**
+ * Attempt to detect if the rawFreq is actually a strong harmonic:
+ * If rawFreq is above ~120 Hz, we check if half that frequency is still
+ * within range and might be the "true" fundamental. 
+ * This is a simplistic approach—feel free to improve or extend.
+ */
+float checkHarmonics(float rawFreq) {
+    if (rawFreq <= 0) return 0.0f;
+
+    // If the raw freq is suspiciously high (say above G3/B3 range),
+    // check if half or a third is also in the valid range.
+    // For guitar E2=82.4 up to E4=329.6, so let's do a couple checks:
+    if (rawFreq > 140.0f) { 
+        float halfF = rawFreq * 0.5f;
+        if (halfF >= MIN_FREQUENCY && halfF <= MAX_FREQUENCY) {
+            // Optionally, we can see if the magnitude at halfF’s bin is also large
+            // but here we just “prefer” half if it’s in range:
+            return halfF;
+        }
+    }
+
+    // You could also check rawFreq * 0.333..., etc., for triple harmonics.
+    // We'll keep it simple here.
+    return rawFreq;
 }
 
 void displayTuning(int noteIndex, float frequency, float difference) {
     u8g2.clearBuffer();
     
     // Only display tuning information if we have a valid frequency
-    if (noteIndex >= 0 && frequency > MIN_FREQUENCY) {
+    if (noteIndex >= 0 && frequency > MIN_FREQUENCY && frequency < MAX_FREQUENCY) {
         // Display the note name
         u8g2.setCursor(xOffset, yOffset);
         u8g2.print(NOTE_NAMES[noteIndex]);
@@ -179,80 +227,33 @@ void displayTuning(int noteIndex, float frequency, float difference) {
         u8g2.print(frequency, 1);
         u8g2.print("Hz");
         
-        // Display tuning indicator with symbols
+        // Display tuning indicator
         u8g2.setCursor(xOffset, yOffset + 25);
-        if (abs(difference) < TUNE_TOLERANCE) {
-            // In tune - display heart
+        if (fabsf(difference) < TUNE_TOLERANCE) {
             u8g2.print("<3 IN TUNE");
         } else {
-            // Calculate position for tuning indicator
             if (difference < 0) {
-                // Flat - need to tighten
-                u8g2.print("T (");
-                u8g2.print(abs(difference), 1);
-                u8g2.print("Hz)");
+                // Flat (need to tighten)
+                u8g2.print("T ");
+                u8g2.print(difference, 1);
+                u8g2.print("Hz");
             } else {
-                // Sharp - need to loosen
-                u8g2.print("L (");
-                u8g2.print(abs(difference), 1);
-                u8g2.print("Hz)");
+                // Sharp (need to loosen)
+                u8g2.print("L +");
+                u8g2.print(difference, 1);
+                u8g2.print("Hz");
             }
         }
     } else {
-        // No note detected - simple message
         u8g2.setCursor(xOffset, yOffset);
         u8g2.print("?");
+
+        u8g2.setCursor(xOffset + 30, yOffset);
+        u8g2.print(frequency, 1);
+        u8g2.print("Hz");
     }
     
     u8g2.setCursor(xOffset, 60);
     u8g2.print("YOU ROCK!");
     u8g2.sendBuffer();
 }
-
-// New function to get the most common frequency from recent readings
-float getMostCommonFrequency() {
-    // Simple approach: group similar frequencies and find the most common group
-    
-    // First check if we have enough readings
-    bool hasValidReadings = false;
-    for (int i = 0; i < FREQ_HISTORY_SIZE; i++) {
-        if (recentFrequencies[i] > MIN_FREQUENCY) {
-            hasValidReadings = true;
-            break;
-        }
-    }
-    
-    if (!hasValidReadings) {
-        return 0; // No valid readings yet
-    }
-    
-    // Group similar frequencies (within 2Hz of each other)
-    const float SIMILARITY_THRESHOLD = 2.0;
-    int bestGroupSize = 0;
-    float bestGroupValue = 0;
-    
-    for (int i = 0; i < FREQ_HISTORY_SIZE; i++) {
-        if (recentFrequencies[i] < MIN_FREQUENCY) continue;
-        
-        // Count frequencies similar to this one
-        int groupSize = 0;
-        float sum = 0;
-        
-        for (int j = 0; j < FREQ_HISTORY_SIZE; j++) {
-            if (recentFrequencies[j] < MIN_FREQUENCY) continue;
-            
-            if (abs(recentFrequencies[i] - recentFrequencies[j]) < SIMILARITY_THRESHOLD) {
-                groupSize++;
-                sum += recentFrequencies[j];
-            }
-        }
-        
-        // If this group is bigger than our best so far, update
-        if (groupSize > bestGroupSize) {
-            bestGroupSize = groupSize;
-            bestGroupValue = sum / groupSize; // Average of the group
-        }
-    }
-    
-    return bestGroupValue;
-} 
